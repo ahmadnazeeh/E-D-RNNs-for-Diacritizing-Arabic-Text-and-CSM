@@ -1,0 +1,667 @@
+import tensorflow as tf
+import numpy as np
+import re
+import os
+import requests
+import time
+import unicodedata
+
+data_path = 'file_path'
+with open(data_path, 'r', encoding='utf-8') as f:
+  lines = f.read()
+  lines = lines.replace('"','')
+
+raw_data = []
+for line in lines.split('\n'):
+    raw_data.append(line.split('\t'))
+    
+# The last element is empty, so omit it
+raw_data = raw_data[:-1]
+raw_data_UnDiac, raw_data_Diac = list(zip(*raw_data))
+raw_data_Diac_in = ['<start> ' + data for data in raw_data_Diac]
+raw_data_Diac_out = [data + ' <end>' for data in raw_data_Diac]
+
+num_samples = 50000 # 30000 # Old 80000 and 40000
+
+input_texts = []
+target_texts = []
+input_characters = set()
+target_characters = set()
+
+with open(data_path, 'r', encoding='utf-8') as f:
+    lines = f.read().split('\n')
+for line in lines[: min(num_samples, len(lines) - 1)]:
+    input_text, target_text = line.split('\t')
+
+    # in_line = input_text.replace('"', '')
+    input_text = input_text.replace('\ufeff', '')
+    input_text = input_text.replace('"', '')
+    
+    # We use "tab" as the "start sequence" character
+    # for the targets, and "\n" as "end sequence" character.
+
+    target_text = '\t' + target_text + '\n'
+    target_text = target_text.replace('"', '')
+    
+    if len(input_text) > 100: 
+        continue              
+
+    input_texts.append(input_text)
+    target_texts.append(target_text)
+    for char in input_text:
+        if char not in input_characters:
+            input_characters.add(char)
+    for char in target_text:
+        if char not in target_characters:
+            target_characters.add(char)
+
+input_characters = sorted(list(input_characters))
+target_characters = sorted(list(target_characters))
+num_encoder_tokens = len(input_characters)
+num_decoder_tokens = len(target_characters)
+max_encoder_seq_length = max([len(txt) for txt in input_texts])
+max_decoder_seq_length = max([len(txt) for txt in target_texts])
+
+input_token_index = dict(
+    [(char, i) for i, char in enumerate(input_characters)])
+target_token_index = dict(
+    [(char, i) for i, char in enumerate(target_characters)])
+
+encoder_input_data = np.zeros(
+    (len(input_texts), max_encoder_seq_length, num_encoder_tokens),
+    dtype='float32')
+decoder_input_data = np.zeros(
+    (len(input_texts), max_decoder_seq_length, num_decoder_tokens),
+    dtype='float32')
+decoder_target_data = np.zeros(
+    (len(input_texts), max_decoder_seq_length, num_decoder_tokens),
+    dtype='float32')
+
+for i, (input_text, target_text) in enumerate(zip(input_texts, target_texts)):
+    for t, char in enumerate(input_text):
+        encoder_input_data[i, t, input_token_index[char]] = 1.
+    for t, char in enumerate(target_text):
+        # decoder_target_data is ahead of decoder_input_data by one timestep
+        decoder_input_data[i, t, target_token_index[char]] = 1.
+        if t > 0:
+            # decoder_target_data will be ahead by one timestep
+            # and will not include the start character.
+            decoder_target_data[i, t - 1, target_token_index[char]] = 1.
+
+"""## Tokenization"""
+
+UnDiac_tokenizer = tf.keras.preprocessing.text.Tokenizer(filters='')
+UnDiac_tokenizer.fit_on_texts(raw_data_UnDiac)
+data_UnDiac = UnDiac_tokenizer.texts_to_sequences(raw_data_UnDiac)
+data_UnDiac = tf.keras.preprocessing.sequence.pad_sequences(data_UnDiac,padding='post')
+
+Diac_tokenizer = tf.keras.preprocessing.text.Tokenizer(filters='')
+Diac_tokenizer.fit_on_texts(raw_data_Diac_in)
+Diac_tokenizer.fit_on_texts(raw_data_Diac_out)
+data_Diac_in = Diac_tokenizer.texts_to_sequences(raw_data_Diac_in)
+data_Diac_in = tf.keras.preprocessing.sequence.pad_sequences(data_Diac_in,padding='post')
+
+data_Diac_out = Diac_tokenizer.texts_to_sequences(raw_data_Diac_out)
+data_Diac_out = tf.keras.preprocessing.sequence.pad_sequences(data_Diac_out,padding='post')
+
+"""## Create tf.data.Dataset object"""
+
+BATCH_SIZE = 512 #64
+dataset = tf.data.Dataset.from_tensor_slices(
+    (data_UnDiac, data_Diac_in, data_Diac_out))
+dataset = dataset.shuffle(len(data_UnDiac)).batch(BATCH_SIZE)
+
+"""## Create the Positional Embedding"""
+
+def positional_encoding(pos, model_size):
+    """ Compute positional encoding for a particular position
+    Args:
+        pos: position of a token in the sequence
+        model_size: depth size of the model
+    
+    Returns:
+        The positional encoding for the given token
+    """
+    PE = np.zeros((1, model_size))
+    for i in range(model_size):
+        if i % 2 == 0:
+            PE[:, i] = np.sin(pos / 10000 ** (i / model_size))
+        else:
+            PE[:, i] = np.cos(pos / 10000 ** ((i - 1) / model_size))
+    return PE
+
+max_length = max(len(data_UnDiac[0]), len(data_Diac_in[0]))
+MODEL_SIZE = 1024 #512 #128
+
+pes = []
+for i in range(max_length):
+    pes.append(positional_encoding(i, MODEL_SIZE))
+
+pes = np.concatenate(pes, axis=0)
+pes = tf.constant(pes, dtype=tf.float32)
+
+"""## Create the Multihead Attention layer"""
+
+class MultiHeadAttention(tf.keras.Model):
+    """ Class for Multi-Head Attention layer
+    Attributes:
+        key_size: d_key in the paper
+        h: number of attention heads
+        wq: the Linear layer for Q
+        wk: the Linear layer for K
+        wv: the Linear layer for V
+        wo: the Linear layer for the output
+    """
+    def __init__(self, model_size, h):
+        super(MultiHeadAttention, self).__init__()
+        self.key_size = model_size // h
+        self.h = h
+        self.wq = tf.keras.layers.Dense(model_size) #[tf.keras.layers.Dense(key_size) for _ in range(h)]
+        self.wk = tf.keras.layers.Dense(model_size) #[tf.keras.layers.Dense(key_size) for _ in range(h)]
+        self.wv = tf.keras.layers.Dense(model_size) #[tf.keras.layers.Dense(value_size) for _ in range(h)]
+        self.wo = tf.keras.layers.Dense(model_size)
+
+    def call(self, query, value, mask=None):
+        """ The forward pass for Multi-Head Attention layer
+        Args:
+            query: the Q matrix
+            value: the V matrix, acts as V and K
+            mask: mask to filter out unwanted tokens
+                  - zero mask: mask for padded tokens
+                  - right-side mask: mask to prevent attention towards tokens on the right-hand side
+        
+        Returns:
+            The concatenated context vector
+            The alignment (attention) vectors of all heads
+        """
+        # query has shape (batch, query_len, model_size)
+        # value has shape (batch, value_len, model_size)
+        query = self.wq(query)
+        key = self.wk(value)
+        value = self.wv(value)
+        
+        # Split matrices for multi-heads attention
+        batch_size = query.shape[0]
+        
+        # Originally, query has shape (batch, query_len, model_size)
+        # We need to reshape to (batch, query_len, h, key_size)
+        query = tf.reshape(query, [batch_size, -1, self.h, self.key_size])
+        # In order to compute matmul, the dimensions must be transposed to (batch, h, query_len, key_size)
+        query = tf.transpose(query, [0, 2, 1, 3])
+        
+        # Do the same for key and value
+        key = tf.reshape(key, [batch_size, -1, self.h, self.key_size])
+        key = tf.transpose(key, [0, 2, 1, 3])
+        value = tf.reshape(value, [batch_size, -1, self.h, self.key_size])
+        value = tf.transpose(value, [0, 2, 1, 3])
+        
+        # Compute the dot score
+        # and divide the score by square root of key_size (as stated in paper)
+        # (must convert key_size to float32 otherwise an error would occur)
+        score = tf.matmul(query, key, transpose_b=True) / tf.math.sqrt(tf.dtypes.cast(self.key_size, dtype=tf.float32))
+        # score will have shape of (batch, h, query_len, value_len)
+        
+        # Mask out the score if a mask is provided
+        # There are two types of mask:
+        # - Padding mask (batch, 1, 1, value_len): to prevent attention being drawn to padded token (i.e. 0)
+        # - Look-left mask (batch, 1, query_len, value_len): to prevent decoder to draw attention to tokens to the right
+        if mask is not None:
+            score *= mask
+
+            # We want the masked out values to be zeros when applying softmax
+            # One way to accomplish that is assign them to a very large negative value
+            score = tf.where(tf.equal(score, 0), tf.ones_like(score) * -1e9, score)
+        
+        # Alignment vector: (batch, h, query_len, value_len)
+        alignment = tf.nn.softmax(score, axis=-1)
+        
+        # Context vector: (batch, h, query_len, key_size)
+        context = tf.matmul(alignment, value)
+        
+        # Finally, do the opposite to have a tensor of shape (batch, query_len, model_size)
+        context = tf.transpose(context, [0, 2, 1, 3])
+        context = tf.reshape(context, [batch_size, -1, self.key_size * self.h])
+        
+        # Apply one last full connected layer (WO)
+        heads = self.wo(context)
+        
+        return heads, alignment
+
+"""## Create the Encoder"""
+
+class Encoder(tf.keras.Model):
+    """ Class for the Encoder
+    Args:
+        model_size: d_model in the paper (depth size of the model)
+        num_layers: number of layers (Multi-Head Attention + FNN)
+        h: number of attention heads
+        embedding: Embedding layer
+        embedding_dropout: Dropout layer for Embedding
+        attention: array of Multi-Head Attention layers
+        attention_dropout: array of Dropout layers for Multi-Head Attention
+        attention_norm: array of LayerNorm layers for Multi-Head Attention
+        dense_1: array of first Dense layers for FFN
+        dense_2: array of second Dense layers for FFN
+        ffn_dropout: array of Dropout layers for FFN
+        ffn_norm: array of LayerNorm layers for FFN
+    """
+    def __init__(self, vocab_size, model_size, num_layers, h):
+        super(Encoder, self).__init__()
+        self.model_size = model_size
+        self.num_layers = num_layers
+        self.h = h
+        self.embedding = tf.keras.layers.Embedding(vocab_size, model_size)
+        self.embedding_dropout = tf.keras.layers.Dropout(0.1)
+        self.attention = [MultiHeadAttention(model_size, h) for _ in range(num_layers)]
+        self.attention_dropout = [tf.keras.layers.Dropout(0.1) for _ in range(num_layers)]
+
+        self.attention_norm = [tf.keras.layers.LayerNormalization(
+            epsilon=1e-6) for _ in range(num_layers)]
+
+        self.dense_1 = [tf.keras.layers.Dense(
+            MODEL_SIZE * 4, activation='relu') for _ in range(num_layers)]
+        self.dense_2 = [tf.keras.layers.Dense(
+            model_size) for _ in range(num_layers)]
+        self.ffn_dropout = [tf.keras.layers.Dropout(0.1) for _ in range(num_layers)]
+        self.ffn_norm = [tf.keras.layers.LayerNormalization(
+            epsilon=1e-6) for _ in range(num_layers)]
+
+    def call(self, sequence, training=True, encoder_mask=None):
+        """ Forward pass for the Encoder
+        Args:
+            sequence: source input sequences
+            training: whether training or not (for Dropout)
+            encoder_mask: padding mask for the Encoder's Multi-Head Attention
+        
+        Returns:
+            The output of the Encoder (batch_size, length, model_size)
+            The alignment (attention) vectors for all layers
+        """
+        embed_out = self.embedding(sequence)
+
+        embed_out *= tf.math.sqrt(tf.cast(self.model_size, tf.float32))
+        embed_out += pes[:sequence.shape[1], :]
+        embed_out = self.embedding_dropout(embed_out)
+
+        sub_in = embed_out
+        alignments = []
+
+        for i in range(self.num_layers):
+            sub_out, alignment = self.attention[i](sub_in, sub_in, encoder_mask)
+            sub_out = self.attention_dropout[i](sub_out, training=training)
+            sub_out = sub_in + sub_out
+            sub_out = self.attention_norm[i](sub_out)
+            
+            alignments.append(alignment)
+            ffn_in = sub_out
+
+            ffn_out = self.dense_2[i](self.dense_1[i](ffn_in))
+            ffn_out = self.ffn_dropout[i](ffn_out, training=training)
+            ffn_out = ffn_in + ffn_out
+            ffn_out = self.ffn_norm[i](ffn_out)
+
+            sub_in = ffn_out
+
+        return ffn_out, alignments
+
+H = 8
+NUM_LAYERS = 6
+vocab_size = len(UnDiac_tokenizer.word_index) + 1
+print('vocab_size:', vocab_size)
+
+encoder = Encoder(vocab_size, MODEL_SIZE, NUM_LAYERS, H)
+sequence_in = tf.constant([[1, 2, 3, 0, 0]])
+encoder_output, _ = encoder(sequence_in)
+encoder_output.shape
+
+class Decoder(tf.keras.Model):
+    """ Class for the Decoder
+    Args:
+        model_size: d_model in the paper (depth size of the model)
+        num_layers: number of layers (Multi-Head Attention + FNN)
+        h: number of attention heads
+        embedding: Embedding layer
+        embedding_dropout: Dropout layer for Embedding
+        attention_bot: array of bottom Multi-Head Attention layers (self attention)
+        attention_bot_dropout: array of Dropout layers for bottom Multi-Head Attention
+        attention_bot_norm: array of LayerNorm layers for bottom Multi-Head Attention
+        attention_mid: array of middle Multi-Head Attention layers
+        attention_mid_dropout: array of Dropout layers for middle Multi-Head Attention
+        attention_mid_norm: array of LayerNorm layers for middle Multi-Head Attention
+        dense_1: array of first Dense layers for FFN
+        dense_2: array of second Dense layers for FFN
+        ffn_dropout: array of Dropout layers for FFN
+        ffn_norm: array of LayerNorm layers for FFN
+        dense: Dense layer to compute final output
+    """
+    def __init__(self, vocab_size, model_size, num_layers, h):
+        super(Decoder, self).__init__()
+        self.model_size = model_size
+        self.num_layers = num_layers
+        self.h = h
+        self.embedding = tf.keras.layers.Embedding(vocab_size, model_size)
+        self.embedding_dropout = tf.keras.layers.Dropout(0.1)
+        self.attention_bot = [MultiHeadAttention(model_size, h) for _ in range(num_layers)]
+        self.attention_bot_dropout = [tf.keras.layers.Dropout(0.1) for _ in range(num_layers)]
+        self.attention_bot_norm = [tf.keras.layers.LayerNormalization(
+            epsilon=1e-6) for _ in range(num_layers)]
+        self.attention_mid = [MultiHeadAttention(model_size, h) for _ in range(num_layers)]
+        self.attention_mid_dropout = [tf.keras.layers.Dropout(0.1) for _ in range(num_layers)]
+        self.attention_mid_norm = [tf.keras.layers.LayerNormalization(
+            epsilon=1e-6) for _ in range(num_layers)]
+
+        self.dense_1 = [tf.keras.layers.Dense(
+            MODEL_SIZE * 4, activation='relu') for _ in range(num_layers)]
+        self.dense_2 = [tf.keras.layers.Dense(
+            model_size) for _ in range(num_layers)]
+        self.ffn_dropout = [tf.keras.layers.Dropout(0.1) for _ in range(num_layers)]
+        self.ffn_norm = [tf.keras.layers.LayerNormalization(
+            epsilon=1e-6) for _ in range(num_layers)]
+
+        self.dense = tf.keras.layers.Dense(vocab_size)
+
+    def call(self, sequence, encoder_output, training=True, encoder_mask=None):
+        """ Forward pass for the Decoder
+        Args:
+            sequence: source input sequences
+            encoder_output: output of the Encoder (for computing middle attention)
+            training: whether training or not (for Dropout)
+            encoder_mask: padding mask for the Encoder's Multi-Head Attention
+        
+        Returns:
+            The output of the Encoder (batch_size, length, model_size)
+            The bottom alignment (attention) vectors for all layers
+            The middle alignment (attention) vectors for all layers
+        """
+        # EMBEDDING AND POSITIONAL EMBEDDING
+        embed_out = self.embedding(sequence)
+
+        embed_out *= tf.math.sqrt(tf.cast(self.model_size, tf.float32))
+        embed_out += pes[:sequence.shape[1], :]
+        embed_out = self.embedding_dropout(embed_out)
+
+        bot_sub_in = embed_out
+        bot_alignments = []
+        mid_alignments = []
+
+        for i in range(self.num_layers):
+            # BOTTOM MULTIHEAD SUB LAYER
+            seq_len = bot_sub_in.shape[1]
+
+            if training:
+                mask = tf.linalg.band_part(tf.ones((seq_len, seq_len)), -1, 0)
+            else:
+                mask = None
+            bot_sub_out, bot_alignment = self.attention_bot[i](bot_sub_in, bot_sub_in, mask)
+            bot_sub_out = self.attention_bot_dropout[i](bot_sub_out, training=training)
+            bot_sub_out = bot_sub_in + bot_sub_out
+            bot_sub_out = self.attention_bot_norm[i](bot_sub_out)
+            
+            bot_alignments.append(bot_alignment)
+
+            # MIDDLE MULTIHEAD SUB LAYER
+            mid_sub_in = bot_sub_out
+
+            mid_sub_out, mid_alignment = self.attention_mid[i](
+                mid_sub_in, encoder_output, encoder_mask)
+            mid_sub_out = self.attention_mid_dropout[i](mid_sub_out, training=training)
+            mid_sub_out = mid_sub_out + mid_sub_in
+            mid_sub_out = self.attention_mid_norm[i](mid_sub_out)
+            
+            mid_alignments.append(mid_alignment)
+
+            # FFN
+            ffn_in = mid_sub_out
+
+            ffn_out = self.dense_2[i](self.dense_1[i](ffn_in))
+            ffn_out = self.ffn_dropout[i](ffn_out, training=training)
+            ffn_out = ffn_out + ffn_in
+            ffn_out = self.ffn_norm[i](ffn_out)
+
+            bot_sub_in = ffn_out
+
+        logits = self.dense(ffn_out)
+
+        return logits, bot_alignments, mid_alignments
+
+vocab_size = len(Diac_tokenizer.word_index) + 1
+
+print('vocab_size:', vocab_size)
+
+decoder = Decoder(vocab_size, MODEL_SIZE, NUM_LAYERS, H)
+
+sequence_in = tf.constant([[14 , 24, 36, 0, 0]])
+decoder_output, _, _ = decoder(sequence_in, encoder_output)
+decoder_output.shape
+
+crossentropy = tf.keras.losses.SparseCategoricalCrossentropy(
+    from_logits=True)
+
+# Add Accuracy 26/7/2020
+
+def loss_func(targets, logits):
+    mask = tf.math.logical_not(tf.math.equal(targets, 0))
+    mask = tf.cast(mask, dtype=tf.int64)
+    loss = crossentropy(targets, logits, sample_weight=mask)
+
+    return loss
+
+metric = tf.keras.metrics.SparseCategoricalAccuracy('accuracy')
+def accu_func(targets, logits):
+    mask = tf.math.logical_not(tf.math.equal(targets, 0))
+    mask = tf.cast(mask, dtype=tf.int64)
+    accuracy = metric(targets, logits, sample_weight=mask)
+
+    return accuracy
+
+class WarmupThenDecaySchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """ Learning schedule for training the Transformer
+    Attributes:
+        model_size: d_model in the paper (depth size of the model)
+        warmup_steps: number of warmup steps at the beginning
+    """
+    def __init__(self, model_size, warmup_steps=4000):
+        super(WarmupThenDecaySchedule, self).__init__()
+
+        self.model_size = model_size
+        self.model_size = tf.cast(self.model_size, tf.float32)
+
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        step_term = tf.math.rsqrt(step)
+        warmup_term = step * (self.warmup_steps ** -1.5)
+
+        return tf.math.rsqrt(self.model_size) * tf.math.minimum(step_term, warmup_term)
+
+lr = WarmupThenDecaySchedule(MODEL_SIZE)
+optimizer = tf.keras.optimizers.Adam(lr,
+                                     beta_1=0.9,
+                                     beta_2=0.98,
+                                     epsilon=1e-9)
+
+def predict(test_source_text=None):
+    """ Predict the output sentence for a given input sentence
+    Args:
+        test_source_text: input sentence (raw string)
+    
+    Returns:
+        The encoder's attention vectors
+        The decoder's bottom attention vectors
+        The decoder's middle attention vectors
+        The input string array (input sentence split by ' ')
+        The output string array
+    """
+    if test_source_text is None:
+        test_source_text = raw_data_UnDiac[np.random.choice(len(raw_data_UnDiac))]
+    print(test_source_text)
+    test_source_seq = UnDiac_tokenizer.texts_to_sequences([test_source_text])
+    print(test_source_seq)
+
+    UnDiac_output, UnDiac_alignments = encoder(tf.constant(test_source_seq), training=False)
+
+    de_input = tf.constant(
+        [[Diac_tokenizer.word_index['<start>']]], dtype=tf.int64)
+
+    out_words = []
+
+    while True:
+        de_output, de_bot_alignments, de_mid_alignments = decoder(de_input, UnDiac_output, training=False)
+        new_word = tf.expand_dims(tf.argmax(de_output, -1)[:, -1], axis=1)
+        out_words.append(Diac_tokenizer.index_word[new_word.numpy()[0][0]])
+
+        # Transformer doesn't have sequential mechanism (i.e. states)
+        # so we have to add the last predicted word to create a new input sequence
+        de_input = tf.concat((de_input, new_word), axis=-1)
+
+        # TODO: get a nicer constraint for the sequence length!
+        if out_words[-1] == '<end>' or len(out_words) > 700: # (Old)==>if out_words[-1] == '<end>' or len(out_words) > 175:
+            break
+
+    print(' '.join(out_words))
+    return UnDiac_alignments, de_bot_alignments, de_mid_alignments, test_source_text.split(' '), out_words
+
+# Add Another function to get the predicted text ==> aaa in 8th-12-20201
+
+def predict2(test_source_text=None):
+    """ Predict the output sentence for a given input sentence
+    Args:
+        test_source_text: input sentence (raw string)
+    
+    Returns:
+        The encoder's attention vectors
+        The decoder's bottom attention vectors
+        The decoder's middle attention vectors
+        The input string array (input sentence split by ' ')
+        The output string array
+    """
+    if test_source_text is None:
+        test_source_text = raw_data_UnDiac[np.random.choice(len(raw_data_UnDiac))]
+    print(test_source_text)
+    test_source_seq = UnDiac_tokenizer.texts_to_sequences([test_source_text])
+    print(test_source_seq)
+
+    UnDiac_output, UnDiac_alignments = encoder(tf.constant(test_source_seq), training=False)
+
+    de_input = tf.constant(
+        [[Diac_tokenizer.word_index['<start>']]], dtype=tf.int64)
+
+    out_words = []
+    out_sentence = ()
+
+    while True:
+        de_output, de_bot_alignments, de_mid_alignments = decoder(de_input, UnDiac_output, training=False)
+        new_word = tf.expand_dims(tf.argmax(de_output, -1)[:, -1], axis=1)
+        out_words.append(Diac_tokenizer.index_word[new_word.numpy()[0][0]])
+
+        # Transformer doesn't have sequential mechanism (i.e. states)
+        # so we have to add the last predicted word to create a new input sequence
+        de_input = tf.concat((de_input, new_word), axis=-1)
+
+        # TODO: get a nicer constraint for the sequence length!
+        if out_words[-1] == '<end>' or len(out_words) > 700: # (Old)==>if out_words[-1] == '<end>' or len(out_words) > 175:
+            break
+
+    print(' '.join(out_words))
+    out_sentence = str(out_words)
+    # out_words_joined = out_words +' '.join(out_words)
+    return out_words
+
+@tf.function
+def train_step(source_seq, target_seq_in, target_seq_out):
+    """ Execute one training step (forward pass + backward pass)
+    Args:
+        source_seq: source sequences
+        target_seq_in: input target sequences (<start> + ...)
+        target_seq_out: output target sequences (... + <end>)
+    
+    Returns:
+        The loss value of the current pass
+    """
+    with tf.GradientTape() as tape:
+        encoder_mask = 1 - tf.cast(tf.equal(source_seq, 0), dtype=tf.float32)
+        # encoder_mask has shape (batch_size, source_len)
+        # we need to add two more dimensions in between
+        # to make it broadcastable when computing attention heads
+        encoder_mask = tf.expand_dims(encoder_mask, axis=1)
+        encoder_mask = tf.expand_dims(encoder_mask, axis=1)
+        encoder_output, _ = encoder(source_seq, encoder_mask=encoder_mask)
+
+        decoder_output, _, _ = decoder(
+            target_seq_in, encoder_output, encoder_mask=encoder_mask)
+        loss = loss_func(target_seq_out, decoder_output)
+        # accuracy = accu_func(target_seq_out, decoder_output)
+    variables = encoder.trainable_variables + decoder.trainable_variables
+    gradients = tape.gradient(loss, variables)
+    optimizer.apply_gradients(zip(gradients, variables))
+
+    return loss
+
+@tf.function
+def train_step2(source_seq, target_seq_in, target_seq_out):
+    """ Execute one training step (forward pass + backward pass)
+    Args:
+        source_seq: source sequences
+        target_seq_in: input target sequences (<start> + ...)
+        target_seq_out: output target sequences (... + <end>)
+    
+    Returns:
+        The accuracy value of the current pass
+    """
+    with tf.GradientTape() as tape:
+        encoder_mask = 1 - tf.cast(tf.equal(source_seq, 0), dtype=tf.float32)
+        # encoder_mask has shape (batch_size, source_len)
+        # we need to add two more dimensions in between
+        # to make it broadcastable when computing attention heads
+        encoder_mask = tf.expand_dims(encoder_mask, axis=1)
+        encoder_mask = tf.expand_dims(encoder_mask, axis=1)
+  
+        encoder_output, _ = encoder(source_seq, encoder_mask=encoder_mask)
+        decoder_output, _, _ = decoder(
+            target_seq_in, encoder_output, encoder_mask=encoder_mask)
+
+        accuracy = accu_func(target_seq_out, decoder_output)
+
+    variables = encoder.trainable_variables + decoder.trainable_variables
+    return accuracy
+NUM_EPOCHS = 1000 #200 # 50 # ==> 15
+predicted_sentence = []
+starttime = time.time()
+for e in range(NUM_EPOCHS):
+    for batch, (source_seq, target_seq_in, target_seq_out) in enumerate(dataset.take(-1)):
+        loss = train_step(source_seq, target_seq_in, target_seq_out)
+        accuracy = train_step2( source_seq, target_seq_in, target_seq_out) 
+
+        if batch % 100 == 0:
+            print('Epoch {} Batch {} Loss: {:.4f} Accuracy: {:.4f} Elapsed time: {:.2f}s'.format(
+                e + 1, batch, loss.numpy(), accuracy.numpy(), time.time() - starttime))
+        
+        starttime = time.time()
+
+    try:
+        predicted_sentence = predict()
+
+    except Exception as e:
+        print(e)
+        continue
+
+y = len(target_texts)
+x = 0.05 * y
+
+expected_sentence=""
+
+f = open('Hyp_enc_dec_2L.txt', 'w', encoding='utf-8')
+
+for seq_index in range(x,y):
+  expected_sentence = predict2(raw_data_UnDiac[seq_index])
+  f.write(str(expected_sentence) + '.' + '\n')
+  if seq_index % 13==0:
+    print (seq_index)
+ f.close()
+
+!pip install --upgrade bleu
+!pip install --upgrade git+git://github.com/zhijing-jin/bleu.git
+from bleu import file_bleu
+ref_files = 'Ref_enc_dec_2L.txt'
+hyp_file = 'Hyp_enc_dec_2L.txt'
+file_bleu(ref_files, hyp_file)
